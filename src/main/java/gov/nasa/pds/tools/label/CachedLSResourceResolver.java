@@ -20,8 +20,8 @@ import java.io.Reader;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.commons.io.IOUtils;
 import org.w3c.dom.ls.LSInput;
 import org.w3c.dom.ls.LSResourceResolver;
@@ -135,8 +135,8 @@ public class CachedLSResourceResolver implements LSResourceResolver {
     }
   }
 
-  /** Hashmap to hold the entities. */
-  private Map<String, byte[]> cachedEntities = new HashMap<>();
+  /** Thread-safe cache of resolved entities keyed by systemId. */
+  private Map<String, byte[]> cachedEntities = new ConcurrentHashMap<>();
 
   /**
    * Per-thread problem handler so that concurrent callers do not overwrite
@@ -158,7 +158,7 @@ public class CachedLSResourceResolver implements LSResourceResolver {
    * @param handler A handler to receive problems during resource resolution.
    */
   public CachedLSResourceResolver(ProblemHandler handler) {
-    cachedEntities = new HashMap<>();
+    cachedEntities = new ConcurrentHashMap<>();
     this.handlerRef.set(handler);
   }
 
@@ -168,8 +168,8 @@ public class CachedLSResourceResolver implements LSResourceResolver {
     if (systemId == null) {
       return null;
     }
-    byte[] entity = cachedEntities.get(systemId);
     LSInputImpl input = new LSInputImpl();
+    byte[] entity = cachedEntities.get(systemId);
     if (entity == null) {
       InputStream in = null;
       URLConnection conn = null;
@@ -199,7 +199,7 @@ public class CachedLSResourceResolver implements LSResourceResolver {
         conn = url.openConnection();
         in = Utility.openConnection(conn);
         entity = IOUtils.toByteArray(in);
-        cachedEntities.put(systemId, entity);
+        cachedEntities.putIfAbsent(systemId, entity);
       } catch (Exception e) {
         ProblemHandler h = handlerRef.get();
         if (h != null) {

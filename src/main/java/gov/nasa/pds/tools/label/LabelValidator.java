@@ -989,7 +989,7 @@ public class LabelValidator {
         transformers.add(document);
         LOG.debug("loadLabelSchematrons:transformers.add:source {}", source);
       } catch (RuntimeException re) {
-        // Unwrap exceptions from computeIfAbsent lambda
+        // Unwrap checked exceptions wrapped by computeIfAbsent lambda
         Throwable cause = re.getCause();
         if (cause instanceof TransformerException) {
           String message = "Schematron '" + source + "' error: " + cause.getMessage();
@@ -1002,11 +1002,6 @@ public class LabelValidator {
               new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
               url));
         }
-      } catch (TransformerException te) {
-        String message = "Schematron '" + source + "' error: " + te.getMessage();
-        handler.addProblem(new ValidationProblem(
-            new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
-            url));
       } catch (Exception e) {
         String message = "Error occurred while loading schematron: " + e.getMessage();
         handler.addProblem(new ValidationProblem(

@@ -216,6 +216,65 @@ class LabelValidatorConcurrencyTest {
   }
 
   /**
+   * Validates with schematron checking enabled from multiple threads concurrently.
+   * This exercises the {@code loadLabelSchematrons} / {@code cachedLabelSchematrons}
+   * {@code ConcurrentHashMap} path and the shared {@code CachedLSResourceResolver}
+   * under concurrent access.
+   */
+  @Test
+  void concurrentParseAndValidate_withSchematron() throws Exception {
+    // Enable label-schematron validation so loadLabelSchematrons is exercised
+    validator.setSchematronCheck(true, true);
+
+    int threadCount = 4;
+    int iterationsPerThread = 2;
+
+    URL labelUrl = findTestLabel();
+    if (labelUrl == null) {
+      System.err.println(
+          "Skipping concurrentParseAndValidate_withSchematron: no test label found");
+      return;
+    }
+
+    ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+    CyclicBarrier barrier = new CyclicBarrier(threadCount);
+    List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+    List<Future<?>> futures = new ArrayList<>();
+
+    for (int t = 0; t < threadCount; t++) {
+      futures.add(pool.submit(() -> {
+        try {
+          barrier.await(30, TimeUnit.SECONDS);
+          for (int i = 0; i < iterationsPerThread; i++) {
+            ProblemContainer handler = new ProblemContainer();
+            Document doc = validator.parseAndValidate(handler, labelUrl);
+            assertNotNull(doc, "Document should not be null with schematron enabled");
+          }
+        } catch (Throwable ex) {
+          errors.add(ex);
+        }
+      }));
+    }
+
+    for (Future<?> f : futures) {
+      f.get(120, TimeUnit.SECONDS);
+    }
+    pool.shutdown();
+    assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS), "Pool should terminate");
+
+    if (!errors.isEmpty()) {
+      StringBuilder sb = new StringBuilder(
+          "Concurrent schematron validation produced errors:\n");
+      for (Throwable err : errors) {
+        sb.append("  ").append(err.getClass().getName())
+            .append(": ").append(err.getMessage()).append("\n");
+        err.printStackTrace();
+      }
+      fail(sb.toString());
+    }
+  }
+
+  /**
    * Locates a PDS4 test label from the github71 test resources.
    */
   private URL findTestLabel() {
