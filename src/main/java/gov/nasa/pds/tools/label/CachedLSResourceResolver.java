@@ -138,7 +138,12 @@ public class CachedLSResourceResolver implements LSResourceResolver {
   /** Hashmap to hold the entities. */
   private Map<String, byte[]> cachedEntities = new HashMap<>();
 
-  private ProblemHandler handler;
+  /**
+   * Per-thread problem handler so that concurrent callers do not overwrite
+   * each other's handler when this resolver is shared (e.g. as an
+   * {@link XMLCatalogResolver} on the singleton {@code LabelValidator}).
+   */
+  private final ThreadLocal<ProblemHandler> handlerRef = new ThreadLocal<>();
 
   /**
    * Constructor.
@@ -150,11 +155,11 @@ public class CachedLSResourceResolver implements LSResourceResolver {
   /**
    * Constructor.
    *
-   * @param container A container to hold messages.
+   * @param handler A handler to receive problems during resource resolution.
    */
   public CachedLSResourceResolver(ProblemHandler handler) {
     cachedEntities = new HashMap<>();
-    this.handler = handler;
+    this.handlerRef.set(handler);
   }
 
   @Override
@@ -196,14 +201,15 @@ public class CachedLSResourceResolver implements LSResourceResolver {
         entity = IOUtils.toByteArray(in);
         cachedEntities.put(systemId, entity);
       } catch (Exception e) {
-        if (handler != null) {
+        ProblemHandler h = handlerRef.get();
+        if (h != null) {
           URL u = null;
           try {
             u = new URL(systemId);
           } catch (MalformedURLException mu) {
             u = url;
           }
-          handler.addProblem(new ValidationProblem(new ProblemDefinition(ExceptionType.FATAL,
+          h.addProblem(new ValidationProblem(new ProblemDefinition(ExceptionType.FATAL,
               ProblemType.LABEL_UNRESOLVABLE_RESOURCE, e.getMessage()), u));
         } else {
           e.printStackTrace();
@@ -233,10 +239,10 @@ public class CachedLSResourceResolver implements LSResourceResolver {
   }
 
   public void setProblemHandler(ProblemHandler handler) {
-    this.handler = handler;
+    this.handlerRef.set(handler);
   }
 
   public ProblemHandler getProblemHandler() {
-    return this.handler;
+    return this.handlerRef.get();
   }
 }

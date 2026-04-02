@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.regex.Matcher;
@@ -90,6 +91,30 @@ import net.sf.saxon.trans.XPathException;
 /**
  * This class is responsible for providing utility functions for validating PDS XML Labels.
  *
+ * <h3>Thread-safety contract</h3>
+ * <p>{@code LabelValidator} is designed to be used as a singleton (see
+ * {@code ValidationResourceManager}) with concurrent validation from multiple
+ * threads.  The following rules apply:</p>
+ * <ul>
+ *   <li><b>Configuration methods</b> ({@link #setSchema}, {@link #setSchematrons},
+ *       {@link #setCatalogs}, {@link #setSchemaCheck}, {@link #setSchematronCheck},
+ *       {@link #setCachedLSResourceResolver}, {@link #setCachedEntityResolver},
+ *       {@link #addValidator}, {@link #setSkipProductValidation}, etc.) are
+ *       <em>setup-time only</em> and must be called from a single thread before
+ *       any concurrent validation begins.  They are not synchronized.</li>
+ *   <li><b>Validation methods</b> ({@link #validate}, {@link #parseAndValidate})
+ *       are safe for concurrent use.  Per-thread mutable parsing state is held
+ *       in a {@link ThreadLocal}{@code <ParserState>}.</li>
+ *   <li>{@link #clear()} may be called between validation runs to reset
+ *       configuration.  It increments a generation counter so that all threads
+ *       will discard stale {@code ParserState} on their next validation call.</li>
+ * </ul>
+ *
+ * <p><b>Note on static helpers:</b> {@link gov.nasa.pds.tools.util.LabelUtil}
+ * methods called from {@code parseAndValidate} ({@code setLocation},
+ * {@code registerIMVersion}) are internally {@code synchronized} and therefore
+ * safe under concurrent validation.</p>
+ *
  * @author pramirez
  *
  */
@@ -100,6 +125,16 @@ public class LabelValidator {
    * Holds per-thread mutable parsing state so that each thread gets its own
    * parser, validator handler, document builder, etc. This allows removing
    * {@code synchronized} from the validation methods.
+   *
+   * <p>A {@code generation} field tracks whether the owning {@code LabelValidator}
+   * has been {@link #clear() cleared} since this state was created. If the
+   * generation is stale, {@link #parseAndValidate} discards and re-creates the
+   * state so that configuration changes made via {@code clear()} are picked up
+   * by every thread, not just the one that called {@code clear()}.</p>
+   *
+   * <p>Note: the constructor wraps {@link ParserConfigurationException} in an
+   * unchecked {@link RuntimeException} because {@link ThreadLocal#withInitial}
+   * cannot propagate checked exceptions.</p>
    */
   private static class ParserState {
     XMLReader cachedParser;
@@ -110,8 +145,10 @@ public class LabelValidator {
     Schema validatingSchema;
     SAXParserFactory saxParserFactory;
     SchemaFactory schemaFactory;
+    long generation;
 
-    ParserState() {
+    ParserState(long generation) {
+      this.generation = generation;
       try {
         // Support for XSD 1.1
         schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
@@ -135,8 +172,15 @@ public class LabelValidator {
     }
   }
 
+  /**
+   * Monotonically increasing generation counter, incremented by {@link #clear()}.
+   * Each {@link ParserState} records the generation it was created for; when a
+   * thread detects a mismatch it discards its stale state and creates a fresh one.
+   */
+  private final AtomicLong configGeneration = new AtomicLong(0);
+
   private final ThreadLocal<ParserState> threadState =
-      ThreadLocal.withInitial(ParserState::new);
+      ThreadLocal.withInitial(() -> new ParserState(configGeneration.get()));
 
   private Map<String, Boolean> configurations = new HashMap<>();
   private List<URL> userSchemaFiles;
@@ -146,7 +190,7 @@ public class LabelValidator {
   private Boolean useLabelSchema;
   private Boolean useLabelSchematron;
   private Boolean skipProductValidation;
-  private Map<String, String> cachedLabelSchematrons;
+  private volatile Map<String, String> cachedLabelSchematrons;
 
   public static final String SCHEMA_CHECK = "gov.nasa.pds.tools.label.SchemaCheck";
   public static final String SCHEMATRON_CHECK = "gov.nasa.pds.tools.label.SchematronCheck";
@@ -154,6 +198,7 @@ public class LabelValidator {
   private List<ExternalValidator> externalValidators;
   private List<DocumentValidator> documentValidators;
   private CachedEntityResolver cachedEntityResolver;
+  private volatile CachedLSResourceResolver sharedCachedLSResolver;
   private SchematronTransformer schematronTransformer;
 
   private final AtomicLong filesProcessed = new AtomicLong(0);
@@ -218,10 +263,13 @@ public class LabelValidator {
     documentValidators = new ArrayList<>();
     useLabelSchema = false;
     useLabelSchematron = false;
-    cachedLabelSchematrons = new HashMap<>();
+    skipProductValidation = false;
+    cachedLabelSchematrons = new ConcurrentHashMap<>();
     cachedEntityResolver = new CachedEntityResolver();
+    sharedCachedLSResolver = null;
 
-    // Clear thread-local parsing state so the next call gets a fresh ParserState
+    // Bump generation so all threads discard stale ParserState on next use
+    configGeneration.incrementAndGet();
     threadState.remove();
 
     documentValidators.add(new DefaultDocumentValidator());
@@ -234,7 +282,7 @@ public class LabelValidator {
    * @param schematronMap
    */
   public void setLabelSchematrons(Map<String, String> schematronMap) {
-    cachedLabelSchematrons = schematronMap;
+    cachedLabelSchematrons = new ConcurrentHashMap<>(schematronMap);
   }
 
   /**
@@ -472,6 +520,11 @@ public class LabelValidator {
     Document xml = null;
 
     ParserState ps = threadState.get();
+    // If clear() was called since this ParserState was created, discard and re-create
+    if (ps.generation != configGeneration.get()) {
+      threadState.remove();
+      ps = threadState.get();
+    }
 
     // Printing debug is expensive. Should uncomment by developer only.
     long startTime = System.currentTimeMillis();
@@ -709,11 +762,22 @@ public class LabelValidator {
       if (handler != null) {
         LOG.debug("createParserIfNeeded:#00BB4");
         ps.schemaFactory.setErrorHandler(new LabelErrorHandler(handler));
-        ps.cachedLSResolver = new CachedLSResourceResolver(handler);
+        // Use the shared resolver set via setCachedLSResourceResolver() if available,
+        // otherwise create a fresh per-thread resolver.
+        if (sharedCachedLSResolver != null) {
+          ps.cachedLSResolver = sharedCachedLSResolver;
+        } else {
+          ps.cachedLSResolver = new CachedLSResourceResolver(handler);
+        }
+        ps.cachedLSResolver.setProblemHandler(handler);
         ps.schemaFactory.setResourceResolver(ps.cachedLSResolver);
       } else {
         LOG.debug("createParserIfNeeded:#00BB5");
-        ps.cachedLSResolver = new CachedLSResourceResolver();
+        if (sharedCachedLSResolver != null) {
+          ps.cachedLSResolver = sharedCachedLSResolver;
+        } else {
+          ps.cachedLSResolver = new CachedLSResourceResolver();
+        }
         ps.schemaFactory.setResourceResolver(ps.cachedLSResolver);
       }
       LOG.debug("createParserIfNeeded:#00BB6");
@@ -910,15 +974,34 @@ public class LabelValidator {
                 + "' through the catalog: " + io.getMessage());
           }
         }
-        if (!this.cachedLabelSchematrons.containsKey(source)) {
-          URL sourceUrl = new URL(source);
-          LOG.debug("loadLabelSchematrons:sourceUrl {}", sourceUrl);
-          document = schematronTransformer.fetch(sourceUrl);
-          cachedLabelSchematrons.put(source, document);          
-        }
-        document = cachedLabelSchematrons.get(source);
+        final String schematronSource = source;
+        document = cachedLabelSchematrons.computeIfAbsent(schematronSource, key -> {
+          try {
+            URL sourceUrl = new URL(key);
+            LOG.debug("loadLabelSchematrons:sourceUrl {}", sourceUrl);
+            return schematronTransformer.fetch(sourceUrl);
+          } catch (RuntimeException re) {
+            throw re;
+          } catch (Exception e) {
+            throw new RuntimeException(e);
+          }
+        });
         transformers.add(document);
         LOG.debug("loadLabelSchematrons:transformers.add:source {}", source);
+      } catch (RuntimeException re) {
+        // Unwrap exceptions from computeIfAbsent lambda
+        Throwable cause = re.getCause();
+        if (cause instanceof TransformerException) {
+          String message = "Schematron '" + source + "' error: " + cause.getMessage();
+          handler.addProblem(new ValidationProblem(
+              new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
+              url));
+        } else {
+          String message = "Error occurred while loading schematron: " + (cause != null ? cause.getMessage() : re.getMessage());
+          handler.addProblem(new ValidationProblem(
+              new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
+              url));
+        }
       } catch (TransformerException te) {
         String message = "Schematron '" + source + "' error: " + te.getMessage();
         handler.addProblem(new ValidationProblem(
@@ -1044,8 +1127,13 @@ public class LabelValidator {
     this.cachedEntityResolver = resolver;
   }
 
+  /**
+   * Sets a shared {@link CachedLSResourceResolver} that will be propagated to
+   * each thread's {@link ParserState} during {@link #createParserIfNeeded}.
+   * This is a setup-time method and must be called before concurrent validation.
+   */
   public void setCachedLSResourceResolver(CachedLSResourceResolver resolver) {
-    this.threadState.get().cachedLSResolver = resolver;
+    this.sharedCachedLSResolver = resolver;
   }
 
   /**
