@@ -26,6 +26,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.DoubleAdder;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.xml.XMLConstants;
@@ -88,23 +91,106 @@ import net.sf.saxon.trans.XPathException;
 /**
  * This class is responsible for providing utility functions for validating PDS XML Labels.
  *
+ * <h3>Thread-safety contract</h3>
+ * <p>{@code LabelValidator} is designed to be used as a singleton (see
+ * {@code ValidationResourceManager}) with concurrent validation from multiple
+ * threads.  The following rules apply:</p>
+ * <ul>
+ *   <li><b>Configuration methods</b> ({@link #setSchema}, {@link #setSchematrons},
+ *       {@link #setCatalogs}, {@link #setSchemaCheck}, {@link #setSchematronCheck},
+ *       {@link #setCachedLSResourceResolver}, {@link #setCachedEntityResolver},
+ *       {@link #addValidator}, {@link #setSkipProductValidation}, etc.) are
+ *       <em>setup-time only</em> and must be called from a single thread before
+ *       any concurrent validation begins.  They are not synchronized.</li>
+ *   <li><b>Validation methods</b> ({@link #validate}, {@link #parseAndValidate})
+ *       are safe for concurrent use.  Per-thread mutable parsing state is held
+ *       in a {@link ThreadLocal}{@code <ParserState>}.</li>
+ *   <li>{@link #clear()} may be called between validation runs to reset
+ *       configuration.  It increments a generation counter so that all threads
+ *       will discard stale {@code ParserState} on their next validation call.</li>
+ * </ul>
+ *
+ * <p><b>Note on static helpers:</b> {@link gov.nasa.pds.tools.util.LabelUtil}
+ * methods called from {@code parseAndValidate} ({@code setLocation},
+ * {@code registerIMVersion}) are internally {@code synchronized} and therefore
+ * safe under concurrent validation.</p>
+ *
  * @author pramirez
  *
  */
 public class LabelValidator {
   private static final Logger LOG = LoggerFactory.getLogger(LabelValidator.class);
+
+  /**
+   * Holds per-thread mutable parsing state so that each thread gets its own
+   * parser, validator handler, document builder, etc. This allows removing
+   * {@code synchronized} from the validation methods.
+   *
+   * <p>A {@code generation} field tracks whether the owning {@code LabelValidator}
+   * has been {@link #clear() cleared} since this state was created. If the
+   * generation is stale, {@link #parseAndValidate} discards and re-creates the
+   * state so that configuration changes made via {@code clear()} are picked up
+   * by every thread, not just the one that called {@code clear()}.</p>
+   *
+   * <p>Note: the constructor wraps {@link ParserConfigurationException} in an
+   * unchecked {@link RuntimeException} because {@link ThreadLocal#withInitial}
+   * cannot propagate checked exceptions.</p>
+   */
+  private static class ParserState {
+    XMLReader cachedParser;
+    ValidatorHandler cachedValidatorHandler;
+    DocumentBuilder docBuilder;
+    List<String> cachedSchematron = new ArrayList<>();
+    CachedLSResourceResolver cachedLSResolver = new CachedLSResourceResolver();
+    Schema validatingSchema;
+    SAXParserFactory saxParserFactory;
+    SchemaFactory schemaFactory;
+    long generation;
+
+    ParserState(long generation) {
+      this.generation = generation;
+      try {
+        // Support for XSD 1.1
+        schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
+
+        saxParserFactory = SAXParserFactory.newInstance();
+        saxParserFactory.setNamespaceAware(true);
+        saxParserFactory.setXIncludeAware(Utility.supportXincludes());
+        saxParserFactory.setValidating(false);
+
+        try {
+          saxParserFactory.setFeature(
+              "http://apache.org/xml/features/xinclude/fixup-base-uris", false);
+        } catch (SAXNotRecognizedException | SAXNotSupportedException e) {
+          // should never happen, and can't recover
+        }
+
+        docBuilder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+      } catch (ParserConfigurationException e) {
+        throw new RuntimeException("Failed to initialise per-thread ParserState", e);
+      }
+    }
+  }
+
+  /**
+   * Monotonically increasing generation counter, incremented by {@link #clear()}.
+   * Each {@link ParserState} records the generation it was created for; when a
+   * thread detects a mismatch it discards its stale state and creates a fresh one.
+   */
+  private final AtomicLong configGeneration = new AtomicLong(0);
+
+  private final ThreadLocal<ParserState> threadState =
+      ThreadLocal.withInitial(() -> new ParserState(configGeneration.get()));
+
   private Map<String, Boolean> configurations = new HashMap<>();
   private List<URL> userSchemaFiles;
   private List<URL> userSchematronFiles;
   private List<String> userSchematronTransformers;
-  private XMLReader cachedParser;
-  private ValidatorHandler cachedValidatorHandler;
-  private List<String> cachedSchematron;
   private XMLCatalogResolver resolver;
   private Boolean useLabelSchema;
   private Boolean useLabelSchematron;
   private Boolean skipProductValidation;
-  private Map<String, String> cachedLabelSchematrons;
+  private volatile Map<String, String> cachedLabelSchematrons;
 
   public static final String SCHEMA_CHECK = "gov.nasa.pds.tools.label.SchemaCheck";
   public static final String SCHEMATRON_CHECK = "gov.nasa.pds.tools.label.SchematronCheck";
@@ -112,28 +198,24 @@ public class LabelValidator {
   private List<ExternalValidator> externalValidators;
   private List<DocumentValidator> documentValidators;
   private CachedEntityResolver cachedEntityResolver;
-  private CachedLSResourceResolver cachedLSResolver;
-  private SAXParserFactory saxParserFactory;
-  private DocumentBuilder docBuilder;
-  private SchemaFactory schemaFactory;
-  private Schema validatingSchema;
+  private volatile CachedLSResourceResolver sharedCachedLSResolver;
   private SchematronTransformer schematronTransformer;
 
-  private long filesProcessed = 0;
-  private double totalTimeElapsed = 0.0;
+  private final AtomicLong filesProcessed = new AtomicLong(0);
+  private final DoubleAdder totalTimeElapsed = new DoubleAdder();
 
   /**
    * Returns the number of files processed by the validation function.
    */
   public long getFilesProcessed() {
-    return (this.filesProcessed);
+    return this.filesProcessed.get();
   }
 
   /**
    * Returns the duration it took to run the validation function.
    */
   public double getTotalTimeElapsed() {
-    return (this.totalTimeElapsed);
+    return this.totalTimeElapsed.sum();
   }
 
   /**
@@ -173,9 +255,6 @@ public class LabelValidator {
     this.configurations.clear();
     this.configurations.put(SCHEMA_CHECK, true);
     this.configurations.put(SCHEMATRON_CHECK, true);
-    cachedParser = null;
-    cachedValidatorHandler = null;
-    cachedSchematron = new ArrayList<>();
     userSchemaFiles = new ArrayList<>();
     userSchematronFiles = new ArrayList<>();
     userSchematronTransformers = new ArrayList<>();
@@ -184,36 +263,14 @@ public class LabelValidator {
     documentValidators = new ArrayList<>();
     useLabelSchema = false;
     useLabelSchematron = false;
-    cachedLabelSchematrons = new HashMap<>();
+    skipProductValidation = false;
+    cachedLabelSchematrons = new ConcurrentHashMap<>();
     cachedEntityResolver = new CachedEntityResolver();
-    cachedLSResolver = new CachedLSResourceResolver();
-    validatingSchema = null;
+    sharedCachedLSResolver = null;
 
-    // Support for XSD 1.1
-    schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
-
-    // We need a SAX parser factory to do the validating parse
-    // to create the DOM tree, so we can insert line numbers
-    // as user data properties of the DOM nodes.
-    saxParserFactory = SAXParserFactory.newInstance();
-    saxParserFactory.setNamespaceAware(true);
-    saxParserFactory.setXIncludeAware(Utility.supportXincludes());
-    // The parser doesn't validate - we use a Validator instead.
-    saxParserFactory.setValidating(false);
-
-    // Don't add xml:base attributes to xi:include content, or it messes up
-    // PDS4 validation.
-    try {
-      saxParserFactory.setFeature("http://apache.org/xml/features/xinclude/fixup-base-uris", false);
-    } catch (SAXNotRecognizedException e) {
-      // should never happen, and can't recover
-    } catch (SAXNotSupportedException e) {
-      // should never happen, and can't recover
-    }
-
-    // We need a document builder to create new documents to insert
-    // parsed XML nodes.
-    docBuilder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+    // Bump generation so all threads discard stale ParserState on next use
+    configGeneration.incrementAndGet();
+    threadState.remove();
 
     documentValidators.add(new DefaultDocumentValidator());
     schematronTransformer = new SchematronTransformer();
@@ -225,7 +282,7 @@ public class LabelValidator {
    * @param schematronMap
    */
   public void setLabelSchematrons(Map<String, String> schematronMap) {
-    cachedLabelSchematrons = schematronMap;
+    cachedLabelSchematrons = new ConcurrentHashMap<>(schematronMap);
   }
 
   /**
@@ -257,13 +314,14 @@ public class LabelValidator {
     return this.resolver;
   }
 
-  private List<StreamSource> loadSchemaSources(List<URL> schemas) throws IOException, SAXException {
+  private List<StreamSource> loadSchemaSources(ParserState ps, List<URL> schemas)
+      throws IOException, SAXException {
     List<StreamSource> sources = new ArrayList<>();
     LOG.debug("loadSchemaSources:schemas {}", schemas);
     String externalLocations = "";
     for (URL schema : schemas) {
       LSInput input =
-          cachedLSResolver.resolveResource("", "", "", schema.toString(), schema.toString());
+          ps.cachedLSResolver.resolveResource("", "", "", schema.toString(), schema.toString());
       StreamSource streamSource = new StreamSource(input.getByteStream());
       streamSource.setSystemId(schema.toString());
       sources.add(streamSource);
@@ -281,7 +339,8 @@ public class LabelValidator {
             + schema.toString() + "': " + e.getMessage());
       }
     }
-    schemaFactory.setProperty("http://apache.org/xml/properties/schema/external-schemaLocation",
+    ps.schemaFactory.setProperty(
+        "http://apache.org/xml/properties/schema/external-schemaLocation",
         externalLocations);
     LOG.debug("loadSchemaSources:schemas,externalLocations,sources {}", schemas, externalLocations,
         sources);
@@ -298,7 +357,7 @@ public class LabelValidator {
     return sources;
   }
 
-  public synchronized void validate(ProblemHandler handler, File labelFile) throws SAXException,
+  public void validate(ProblemHandler handler, File labelFile) throws SAXException,
       IOException, ParserConfigurationException, TransformerException, MissingLabelSchemaException {
     validate(handler, labelFile.toURI().toURL());
   }
@@ -315,12 +374,12 @@ public class LabelValidator {
    * @throws TransformerException if there is an error during Schematron transformation
    * @throws MissingLabelSchemaException if the label schema cannot be found
    */
-  public synchronized void validate(ProblemHandler handler, URL url) throws SAXException,
+  public void validate(ProblemHandler handler, URL url) throws SAXException,
       IOException, ParserConfigurationException, TransformerException, MissingLabelSchemaException {
     this.parseAndValidate(handler, url);
   }
 
-  public synchronized void validate(ProblemHandler handler, URL url, String labelExtension)
+  public void validate(ProblemHandler handler, URL url, String labelExtension)
       throws SAXException, IOException, ParserConfigurationException, TransformerException,
       MissingLabelSchemaException {
     this.parseAndValidate(handler, url);
@@ -453,12 +512,19 @@ public class LabelValidator {
    * @throws TransformerException if there is an error during Schematron transformation
    * @throws MissingLabelSchemaException if the label schema cannot be found
    */
-  public synchronized Document parseAndValidate(ProblemHandler handler, URL url)
+  public Document parseAndValidate(ProblemHandler handler, URL url)
       throws SAXException, IOException, ParserConfigurationException, TransformerException,
       MissingLabelSchemaException {
     EveryNCounter.getInstance().increment(Group.label_validation);
     List<String> labelSchematronRefs = new ArrayList<>();
     Document xml = null;
+
+    ParserState ps = threadState.get();
+    // If clear() was called since this ParserState was created, discard and re-create
+    if (ps.generation != configGeneration.get()) {
+      threadState.remove();
+      ps = threadState.get();
+    }
 
     // Printing debug is expensive. Should uncomment by developer only.
     long startTime = System.currentTimeMillis();
@@ -472,32 +538,32 @@ public class LabelValidator {
 
     // Are we performing schema validation?
     if (performsSchemaValidation()) {
-      createParserIfNeeded(handler);
+      createParserIfNeeded(ps, handler);
       checkSchemaSchematronVersions(handler, url);
 
       // Do we need this to clear the cache?
 
       if (useLabelSchema) {
         LOG.debug("parseAndValidate:#00AA0");
-        cachedValidatorHandler = schemaFactory.newSchema().newValidatorHandler();
+        ps.cachedValidatorHandler = ps.schemaFactory.newSchema().newValidatorHandler();
       } else {
         LOG.debug("parseAndValidate:#00AA1");
-        cachedValidatorHandler = validatingSchema.newValidatorHandler();
+        ps.cachedValidatorHandler = ps.validatingSchema.newValidatorHandler();
       }
 
       // Capture messages in a container
       if (handler != null) {
         LOG.debug("parseAndValidate:#00AA2");
         ErrorHandler eh = new LabelErrorHandler(handler);
-        cachedParser.setErrorHandler(eh);
-        cachedValidatorHandler.setErrorHandler(eh);
+        ps.cachedParser.setErrorHandler(eh);
+        ps.cachedValidatorHandler.setErrorHandler(eh);
 
       }
       LOG.debug("parseAndValidate:#00AA3");
       // Finally parse and validate the file
-      xml = docBuilder.newDocument();
-      cachedParser.setContentHandler(new DocumentCreator(xml));
-      cachedParser.parse(Utility.getInputSourceByURL(url));
+      xml = ps.docBuilder.newDocument();
+      ps.cachedParser.setContentHandler(new DocumentCreator(xml));
+      ps.cachedParser.parse(Utility.getInputSourceByURL(url));
 
       // Each version of the Information Model (IM) must be registered so in the end,
       // multiple versions can be reported.
@@ -506,19 +572,19 @@ public class LabelValidator {
       LabelUtil.registerIMVersion(informationModelVersion);
 
       DOMLocator locator = new DOMLocator(url);
-      cachedValidatorHandler.setDocumentLocator(locator);
+      ps.cachedValidatorHandler.setDocumentLocator(locator);
       if (resolver != null) {
         LOG.debug("parseAndValidate:#00AA4");
-        cachedValidatorHandler.setResourceResolver(resolver);
+        ps.cachedValidatorHandler.setResourceResolver(resolver);
         resolver.setProblemHandler(handler);
       } else {
         LOG.debug("parseAndValidate:#00AA5");
-        cachedValidatorHandler.setResourceResolver(cachedLSResolver);
+        ps.cachedValidatorHandler.setResourceResolver(ps.cachedLSResolver);
       }
 
       if (!skipProductValidation) {
         LOG.debug("parseAndValidate:#00AA6");
-        walkNode(xml, cachedValidatorHandler, locator);
+        walkNode(xml, ps.cachedValidatorHandler, locator);
       }
       LOG.debug("parseAndValidate:#00AA7");
 
@@ -533,8 +599,8 @@ public class LabelValidator {
       }
     } else {
       // No Schema validation will be performed. Just parse the label
-      XMLReader reader = saxParserFactory.newSAXParser().getXMLReader();
-      xml = docBuilder.newDocument();
+      XMLReader reader = ps.saxParserFactory.newSAXParser().getXMLReader();
+      xml = ps.docBuilder.newDocument();
       reader.setContentHandler(new DocumentCreator(xml));
       // Capture messages in a container
       if (handler != null) {
@@ -554,7 +620,7 @@ public class LabelValidator {
     // succeed.
 
     LOG.debug("parseAndValidate:0001:url,useLabelSchematron,cachedSchematron.size() {},{},{}", url,
-        useLabelSchematron, cachedSchematron.size());
+        useLabelSchematron, ps.cachedSchematron.size());
     // Validate with any schematron files we have
     if (performsSchematronValidation()) {
       // Look for schematron files specified in a label
@@ -562,25 +628,25 @@ public class LabelValidator {
         labelSchematronRefs = getSchematrons(xml.getChildNodes(), url, handler);
       }
       LOG.debug("parseAndValidate:0002:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-          url, useLabelSchematron, cachedSchematron.size());
-      if (cachedSchematron.isEmpty()) {
+          url, useLabelSchematron, ps.cachedSchematron.size());
+      if (ps.cachedSchematron.isEmpty()) {
         if (useLabelSchematron) {
-          cachedSchematron = loadLabelSchematrons(labelSchematronRefs, url, handler);
+          ps.cachedSchematron = loadLabelSchematrons(labelSchematronRefs, url, handler);
         } else if (!userSchematronTransformers.isEmpty()) {
-          cachedSchematron = userSchematronTransformers;
+          ps.cachedSchematron = userSchematronTransformers;
           LOG.debug("parseAndValidate:0003:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-              url, useLabelSchematron, cachedSchematron.size());
+              url, useLabelSchematron, ps.cachedSchematron.size());
         } else if (!userSchematronFiles.isEmpty()) {
           List<String> transformers = new ArrayList<>();
           for (URL schematron : userSchematronFiles) {
             transformers.add(schematronTransformer.fetch(schematron, handler));
           }
-          cachedSchematron = transformers;
+          ps.cachedSchematron = transformers;
           LOG.debug("parseAndValidate:0004:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-              url, useLabelSchematron, cachedSchematron.size());
+              url, useLabelSchematron, ps.cachedSchematron.size());
         }
         LOG.debug("parseAndValidate:0010:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-            url, useLabelSchematron, cachedSchematron.size());
+            url, useLabelSchematron, ps.cachedSchematron.size());
       } else {
         // If there are cached schematrons....
         LOG.debug(
@@ -588,16 +654,16 @@ public class LabelValidator {
             url, useLabelSchematron, userSchematronTransformers.isEmpty());
         if (useLabelSchematron) {
           if (!userSchematronTransformers.isEmpty()) {
-            cachedSchematron = userSchematronTransformers;
+            ps.cachedSchematron = userSchematronTransformers;
           } else {
-            cachedSchematron = loadLabelSchematrons(labelSchematronRefs, url, handler);
+            ps.cachedSchematron = loadLabelSchematrons(labelSchematronRefs, url, handler);
           }
         }
         LOG.debug("parseAndValidate:0020:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-            url, useLabelSchematron, cachedSchematron.size());
+            url, useLabelSchematron, ps.cachedSchematron.size());
       }
       LOG.debug("parseAndValidate:0030:url,useLabelSchematron,cachedSchematron.size() {},{},{}",
-          url, useLabelSchematron, cachedSchematron.size());
+          url, useLabelSchematron, ps.cachedSchematron.size());
 
       // Determine if schematron validation should be done or not.
       // Note: schematron validation can be time consuming. Only the bundle or
@@ -608,7 +674,7 @@ public class LabelValidator {
       LOG.debug("parseAndValidate:url,skipProductValidation,validateAgainstSchematronFlag {},{},{}",
           url, skipProductValidation, validateAgainstSchematronFlag);
 
-      for (String schematron : cachedSchematron) {
+      for (String schematron : ps.cachedSchematron) {
         try {
           long singleSchematronStartTime = System.currentTimeMillis();
           if (!validateAgainstSchematronFlag) {
@@ -664,83 +730,95 @@ public class LabelValidator {
       }
     }
 
-    this.filesProcessed += 1;
+    this.filesProcessed.incrementAndGet();
     long finishTime = System.currentTimeMillis();
     long timeElapsed = finishTime - startTime;
-    this.totalTimeElapsed += timeElapsed;
+    this.totalTimeElapsed.add(timeElapsed);
     LOG.debug(
         "parseAndValidate:url,skipProductValidation,this.filesProcessed,timeElapsed,this.totalTimeElapsed/1000.0 {},{},{},{},{}",
-        url, skipProductValidation, this.filesProcessed, timeElapsed,
-        this.totalTimeElapsed / 1000.0);
+        url, skipProductValidation, this.filesProcessed.get(), timeElapsed,
+        this.totalTimeElapsed.sum() / 1000.0);
     return xml;
   }
 
-  private void createParserIfNeeded(ProblemHandler handler) throws SAXNotRecognizedException,
-      SAXNotSupportedException, SAXException, IOException, ParserConfigurationException {
+  private void createParserIfNeeded(ParserState ps, ProblemHandler handler)
+      throws SAXNotRecognizedException, SAXNotSupportedException, SAXException, IOException,
+      ParserConfigurationException {
     // Do we have a schema we have loaded previously?
-    LOG.debug("createParserIfNeeded:cachedParser,resolver,handler {},{},{}", cachedParser, resolver,
-        handler);
+    LOG.debug("createParserIfNeeded:cachedParser,resolver,handler {},{},{}", ps.cachedParser,
+        resolver, handler);
     LOG.debug("createParserIfNeeded:#00BB0");
-    if (cachedParser == null) {
+    if (ps.cachedParser == null) {
       LOG.debug("createParserIfNeeded:#00BB1");
       // If catalog is used, allow resources to be loaded for schemas
       // and the document parser
       if (resolver != null) {
         LOG.debug("createParserIfNeeded:#00BB2");
-        schemaFactory.setProperty("http://apache.org/xml/properties/internal/entity-resolver",
-            resolver);
+        ps.schemaFactory.setProperty(
+            "http://apache.org/xml/properties/internal/entity-resolver", resolver);
       }
       LOG.debug("createParserIfNeeded:#00BB3");
       // Allow errors that happen in the schema to be logged there
       if (handler != null) {
         LOG.debug("createParserIfNeeded:#00BB4");
-        schemaFactory.setErrorHandler(new LabelErrorHandler(handler));
-        cachedLSResolver = new CachedLSResourceResolver(handler);
-        schemaFactory.setResourceResolver(cachedLSResolver);
+        ps.schemaFactory.setErrorHandler(new LabelErrorHandler(handler));
+        // Use the shared resolver set via setCachedLSResourceResolver() if available,
+        // otherwise create a fresh per-thread resolver.
+        if (sharedCachedLSResolver != null) {
+          ps.cachedLSResolver = sharedCachedLSResolver;
+        } else {
+          ps.cachedLSResolver = new CachedLSResourceResolver(handler);
+        }
+        ps.cachedLSResolver.setProblemHandler(handler);
+        ps.schemaFactory.setResourceResolver(ps.cachedLSResolver);
       } else {
         LOG.debug("createParserIfNeeded:#00BB5");
-        cachedLSResolver = new CachedLSResourceResolver();
-        schemaFactory.setResourceResolver(cachedLSResolver);
+        if (sharedCachedLSResolver != null) {
+          ps.cachedLSResolver = sharedCachedLSResolver;
+        } else {
+          ps.cachedLSResolver = new CachedLSResourceResolver();
+        }
+        ps.schemaFactory.setResourceResolver(ps.cachedLSResolver);
       }
       LOG.debug("createParserIfNeeded:#00BB6");
       // Time to load schema that will be used for validation
       if (!userSchemaFiles.isEmpty()) {
         LOG.debug("createParserIfNeeded:#00BB7");
         // User has specified schema files to use
-        validatingSchema = schemaFactory
-            .newSchema(loadSchemaSources(userSchemaFiles).toArray(new StreamSource[0]));
+        ps.validatingSchema = ps.schemaFactory
+            .newSchema(loadSchemaSources(ps, userSchemaFiles).toArray(new StreamSource[0]));
       } else if (resolver == null) {
         LOG.debug("createParserIfNeeded:#00BB8");
         if (useLabelSchema || !VersionInfo.hasSchemaDir()) {
           LOG.debug("createParserIfNeeded:#00BB9");
-          validatingSchema = schemaFactory.newSchema();
+          ps.validatingSchema = ps.schemaFactory.newSchema();
         } else {
           LOG.debug("createParserIfNeeded:#00BC0");
           // Load from user specified external directory
-          validatingSchema = schemaFactory.newSchema(
+          ps.validatingSchema = ps.schemaFactory.newSchema(
               loadSchemaSources(VersionInfo.getSchemasFromDirectory().toArray(new String[0]))
                   .toArray(new StreamSource[0]));
         }
       } else {
         LOG.debug("createParserIfNeeded:#00BC1");
         // We're only going to use the catalog to validate against.
-        validatingSchema = schemaFactory.newSchema();
+        ps.validatingSchema = ps.schemaFactory.newSchema();
       }
 
       LOG.debug("createParserIfNeeded:#00BC2");
-      cachedParser = saxParserFactory.newSAXParser().getXMLReader();
-      cachedValidatorHandler = validatingSchema.newValidatorHandler();
+      ps.cachedParser = ps.saxParserFactory.newSAXParser().getXMLReader();
+      ps.cachedValidatorHandler = ps.validatingSchema.newValidatorHandler();
       if (resolver != null) {
         LOG.debug("createParserIfNeeded:#00BC3");
-        cachedParser.setEntityResolver(resolver);
-        docBuilder.setEntityResolver(resolver);
+        ps.cachedParser.setEntityResolver(resolver);
+        ps.docBuilder.setEntityResolver(resolver);
       } else if (useLabelSchema) {
         LOG.debug("createParserIfNeeded:#00BC4");
-        cachedParser.setEntityResolver(cachedEntityResolver);
+        ps.cachedParser.setEntityResolver(cachedEntityResolver);
       }
       LOG.debug("createParserIfNeeded:#00BC5");
       LOG.debug("createParserIfNeeded:cachedParser,cachedValidatorHandler,resolver {},{},{}",
-          cachedParser, cachedValidatorHandler, resolver);
+          ps.cachedParser, ps.cachedValidatorHandler, resolver);
     } else {
       // TODO: This code doesn't look right. It says that if we have
       // a cached parser, but we are using the label schema, then
@@ -753,9 +831,9 @@ public class LabelValidator {
       LOG.debug("createParserIfNeeded:#00BC6");
       if (useLabelSchema) {
         LOG.debug("createParserIfNeeded:#00BC7");
-        cachedParser = saxParserFactory.newSAXParser().getXMLReader();
-        cachedValidatorHandler = schemaFactory.newSchema().newValidatorHandler();
-        cachedParser.setEntityResolver(cachedEntityResolver);
+        ps.cachedParser = ps.saxParserFactory.newSAXParser().getXMLReader();
+        ps.cachedValidatorHandler = ps.schemaFactory.newSchema().newValidatorHandler();
+        ps.cachedParser.setEntityResolver(cachedEntityResolver);
       }
       LOG.debug("createParserIfNeeded:#00BC8");
     }
@@ -896,20 +974,34 @@ public class LabelValidator {
                 + "' through the catalog: " + io.getMessage());
           }
         }
-        if (!this.cachedLabelSchematrons.containsKey(source)) {
-          URL sourceUrl = new URL(source);
-          LOG.debug("loadLabelSchematrons:sourceUrl {}", sourceUrl);
-          document = schematronTransformer.fetch(sourceUrl);
-          cachedLabelSchematrons.put(source, document);          
-        }
-        document = cachedLabelSchematrons.get(source);
+        final String schematronSource = source;
+        document = cachedLabelSchematrons.computeIfAbsent(schematronSource, key -> {
+          try {
+            URL sourceUrl = new URL(key);
+            LOG.debug("loadLabelSchematrons:sourceUrl {}", sourceUrl);
+            return schematronTransformer.fetch(sourceUrl);
+          } catch (RuntimeException re) {
+            throw re;
+          } catch (Exception e) {
+            throw new RuntimeException(e);
+          }
+        });
         transformers.add(document);
         LOG.debug("loadLabelSchematrons:transformers.add:source {}", source);
-      } catch (TransformerException te) {
-        String message = "Schematron '" + source + "' error: " + te.getMessage();
-        handler.addProblem(new ValidationProblem(
-            new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
-            url));
+      } catch (RuntimeException re) {
+        // Unwrap checked exceptions wrapped by computeIfAbsent lambda
+        Throwable cause = re.getCause();
+        if (cause instanceof TransformerException) {
+          String message = "Schematron '" + source + "' error: " + cause.getMessage();
+          handler.addProblem(new ValidationProblem(
+              new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
+              url));
+        } else {
+          String message = "Error occurred while loading schematron: " + (cause != null ? cause.getMessage() : re.getMessage());
+          handler.addProblem(new ValidationProblem(
+              new ProblemDefinition(ExceptionType.ERROR, ProblemType.SCHEMATRON_ERROR, message),
+              url));
+        }
       } catch (Exception e) {
         String message = "Error occurred while loading schematron: " + e.getMessage();
         handler.addProblem(new ValidationProblem(
@@ -1030,8 +1122,13 @@ public class LabelValidator {
     this.cachedEntityResolver = resolver;
   }
 
+  /**
+   * Sets a shared {@link CachedLSResourceResolver} that will be propagated to
+   * each thread's {@link ParserState} during {@link #createParserIfNeeded}.
+   * This is a setup-time method and must be called before concurrent validation.
+   */
   public void setCachedLSResourceResolver(CachedLSResourceResolver resolver) {
-    this.cachedLSResolver = resolver;
+    this.sharedCachedLSResolver = resolver;
   }
 
   /**
